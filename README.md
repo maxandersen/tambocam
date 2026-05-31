@@ -137,11 +137,10 @@ tambocam/
 
 ### How it works
 
-```
-┌─────────────┐     raw RGB24      ┌──────────────┐     Buffer     ┌──────────┐
-│   ffmpeg     │ ──────────────────▶│  FrameSource  │ ────────────▶│ Terminal  │
-│  (camera)    │  background thread │  (ImageData)  │  TamboUI     │  (diff)   │
-└─────────────┘                    └──────────────┘  render        └──────────┘
+```mermaid
+flowchart LR
+    A[ffmpeg<br/>camera] -- "raw RGB24<br/>background thread" --> B[FrameSource<br/>ImageData]
+    B -- "TamboUI<br/>render" --> C[Terminal<br/>diff]
 ```
 
 1. **Camera probe** — runs ffmpeg with intentionally unsupported settings to discover supported resolutions and framerates, then picks the smallest usable mode
