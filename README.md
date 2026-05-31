@@ -4,6 +4,15 @@
 
 Live camera feed rendered directly in your terminal — ASCII art, half-block pixels, or braille dots. Compact camera-monitor HUD with interactive controls for brightness, contrast, color tints, and render modes.
 
+## Install & Run
+
+```bash
+jbang app install tambocam@maxandersen/tambocam
+tambocam
+```
+
+> Don't have JBang? `curl -Ls https://sh.jbang.dev | bash` or `brew install jbang`
+
 ![tambocam demo](demo.gif)
 
 [▶ Full quality video (demo.mp4)](https://github.com/maxandersen/tambocam/raw/main/demo.mp4)
