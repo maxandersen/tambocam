@@ -54,7 +54,7 @@ final class CameraDevice {
                 System.out.println("  " + d);
             }
             System.out.println();
-            System.out.println("Usage: terminalcam-demo --camera=" + devices.get(0).index());
+            System.out.println("Usage: tambocam --camera=" + devices.get(0).index());
         }
     }
 

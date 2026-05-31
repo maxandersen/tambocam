@@ -10,10 +10,15 @@
 
 
 import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
 import java.util.List;
+
+import static dev.tamboui.export.ExportRequest.export;
 
 import dev.tamboui.image.Image;
 import dev.tamboui.image.ImageData;
@@ -45,7 +50,7 @@ import dev.tamboui.widgets.paragraph.Paragraph;
 /**
  * Terminalcam-style TamboUI demo.
  */
-public class TerminalCamDemo {
+public class TamboCamDemo {
 
     private static final DateTimeFormatter CLOCK = DateTimeFormatter.ofPattern("HH:mm:ss");
     private static final ImageProtocol HALF_BLOCK = new HalfBlockProtocol();
@@ -70,7 +75,11 @@ public class TerminalCamDemo {
     private int renderMode;
     private ImageProtocol protocol;
     private final AsciiArtRenderer asciiRenderer = new AsciiArtRenderer();
+    private dev.tamboui.buffer.Buffer lastBuffer;
+    private ImageData lastFrame;
     private String status = "Booted synthetic camera feed";
+    private String flashMessage;
+    private long flashExpiry;
 
     /**
      * Demo entry point.
@@ -87,26 +96,27 @@ public class TerminalCamDemo {
             printUsage();
             return;
         }
-        new TerminalCamDemo(args).run();
+        new TamboCamDemo(args).run();
     }
 
     private static void printUsage() {
-        System.out.println("terminalcam-demo — Terminal camera monitor");
+        System.out.println("tambocam — Terminal camera monitor");
         System.out.println();
         System.out.println("Usage:");
-        System.out.println("  terminalcam-demo                    synthetic test pattern");
-        System.out.println("  terminalcam-demo --camera            macOS camera (device 0)");
-        System.out.println("  terminalcam-demo --camera=N          specific camera device");
-        System.out.println("  terminalcam-demo --list-cameras      list available cameras");
-        System.out.println("  terminalcam-demo <image>             display a still image");
-        System.out.println("  terminalcam-demo <file.gif>          animate a GIF");
-        System.out.println("  terminalcam-demo <directory>         cycle images from dir");
+        System.out.println("  tambocam                    synthetic test pattern");
+        System.out.println("  tambocam --camera            macOS camera (device 0)");
+        System.out.println("  tambocam --camera=N          specific camera device");
+        System.out.println("  tambocam --list-cameras      list available cameras");
+        System.out.println("  tambocam <image>             display a still image");
+        System.out.println("  tambocam <file.gif>          animate a GIF");
+        System.out.println("  tambocam <directory>         cycle images from dir");
         System.out.println();
         System.out.println("Controls:");
         System.out.println("  SPACE  play/pause    m  mode    p  palette    h  toggle HUD");
         System.out.println("  +/-    brightness    [/]  contrast    q  quit");
         System.out.println("  n      next camera (or next frame if no cameras)");
         System.out.println("  b      prev camera (or prev frame if no cameras)");
+        System.out.println("  s      save snapshot (PNG + SVG)");
     }
 
     /**
@@ -115,7 +125,7 @@ public class TerminalCamDemo {
      * @param args optional source path, either a still image, GIF, or directory of images
      * @throws IOException if backend setup fails
      */
-    public TerminalCamDemo(String[] args) throws IOException {
+    public TamboCamDemo(String[] args) throws IOException {
         try (Backend backend = BackendFactory.create()) {
             if (backend instanceof RecordingBackend) {
                 this.capabilities = TerminalImageCapabilities.withSupport(java.util.EnumSet.of(
@@ -282,8 +292,35 @@ public class TerminalCamDemo {
                     status = "Previous frame";
                 }
                 break;
+            case 's':
+            case 'S':
+                saveSnapshot();
+                break;
             default:
                 break;
+        }
+    }
+
+    private void flash(String message) {
+        flashMessage = message;
+        flashExpiry = System.currentTimeMillis() + 3000;
+        status = message;
+    }
+
+    private void saveSnapshot() {
+        String ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+        try {
+            String pngName = "tambocam_" + ts + ".png";
+            String svgName = "tambocam_" + ts + ".svg";
+            if (lastFrame != null) {
+                javax.imageio.ImageIO.write(lastFrame.toBufferedImage(), "png", Paths.get(pngName).toFile());
+            }
+            if (lastBuffer != null) {
+                export(lastBuffer).toFile(Paths.get(svgName));
+            }
+            flash("✔ Saved " + pngName + " + " + svgName);
+        } catch (IOException e) {
+            flash("Save failed: " + e.getMessage());
         }
     }
 
@@ -319,7 +356,7 @@ public class TerminalCamDemo {
 
         Paragraph header = Paragraph.builder()
             .text(Text.from(Line.from(
-                Span.raw(" TERMINALCAM ").bold().reversed(),
+                Span.raw(" TAMBOCAM ").bold().reversed(),
                 Span.raw("  "),
                 Span.raw(sourceName).bold().cyan(),
                 !availableCameras.isEmpty()
@@ -349,8 +386,18 @@ public class TerminalCamDemo {
         if (liveCamera) {
             status = camera.status();
         }
+        // Flash message overrides status for a few seconds
+        if (flashMessage != null) {
+            if (System.currentTimeMillis() < flashExpiry) {
+                status = flashMessage;
+            } else {
+                flashMessage = null;
+            }
+        }
 
         ImageData adjusted = adjustFrame(currentFrame);
+        lastFrame = adjusted;
+        lastBuffer = frame.buffer();
         Rect viewport = cols.get(0);
 
         if (renderMode == 2) {
@@ -428,6 +475,7 @@ public class TerminalCamDemo {
                     key("m"), label(" mode  "),
                     key("p"), label(" palette  "),
                     key("n/b"), label(!availableCameras.isEmpty() ? " cam  " : " frame  "),
+                    key("s"), label(" save  "),
                     key("h"), label(" hud  "),
                     key("q"), label(" quit")
                 ),

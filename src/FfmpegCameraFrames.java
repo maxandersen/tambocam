@@ -1,26 +1,34 @@
 
-
 import java.awt.Color;
 import java.awt.Font;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
+import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import dev.tamboui.image.ImageData;
 
 /**
- * Live camera frame source using ffmpeg with avfoundation (macOS).
+ * Live camera frame source using ffmpeg.
  * <p>
- * Reads <strong>raw RGB24</strong> frames from ffmpeg stdout — no PNG
- * encode/decode overhead. This matches the approach used by terminalcam
- * for maximum throughput.
+ * Auto-detects supported camera modes (resolution + framerate) by probing
+ * ffmpeg, then picks the smallest usable resolution to minimize scaling
+ * overhead. Reads raw RGB24 frames from stdout for maximum throughput.
+ * <p>
+ * Supports macOS (avfoundation), Linux (v4l2), and Windows (dshow).
  */
 final class FfmpegCameraFrames implements AutoCloseable {
 
@@ -30,6 +38,10 @@ final class FfmpegCameraFrames implements AutoCloseable {
     private static final int FRAME_H = 96;
     /** Bytes per raw RGB24 frame. */
     private static final int FRAME_BYTES = FRAME_W * FRAME_H * 3;
+
+    /** Pattern to parse modes like: 1280x720@[30.000030 30.000030]fps */
+    private static final Pattern MODE_PATTERN =
+        Pattern.compile("(\\d+)x(\\d+)@\\[([\\d.]+)\\s");
 
     private final AtomicReference<ImageData> latestFrame;
     private final AtomicReference<String> status;
@@ -51,51 +63,257 @@ final class FfmpegCameraFrames implements AutoCloseable {
 
     static FfmpegCameraFrames start(int deviceIndex) throws IOException {
         AtomicReference<ImageData> latestFrame =
-            new AtomicReference<ImageData>(createWaitingFrame("Connecting to camera " + deviceIndex + "..."));
+            new AtomicReference<ImageData>(createWaitingFrame("Probing camera " + deviceIndex + "..."));
         AtomicReference<String> status =
-            new AtomicReference<String>("Waiting for camera " + deviceIndex + "...");
+            new AtomicReference<String>("Probing camera " + deviceIndex + "...");
         AtomicInteger frameCount = new AtomicInteger(0);
 
-        // Build platform-specific capture command, matching terminalcam's approach:
-        // - Output raw RGB24 — no encode/decode overhead
-        // - fps=15 in filter to balance smoothness vs throughput
-        // - Scale to terminal-friendly size in filter chain
-        List<String> cmd = new java.util.ArrayList<String>();
+        String os = System.getProperty("os.name", "").toLowerCase();
+
+        // Probe camera to discover supported modes
+        List<CameraMode> modes = probeCamera(deviceIndex, os);
+
+        // Build capture command with best available mode
+        List<String> cmd = buildCommand(deviceIndex, os, modes);
+
+        String commandLineStr = formatCommand(cmd);
+        status.set("Starting: " + commandLineStr);
+        latestFrame.set(createWaitingFrame("Starting camera " + deviceIndex + "..."));
+
+        ProcessBuilder builder = new ProcessBuilder(cmd);
+        Process process;
+        try {
+            process = builder.start();
+        } catch (IOException e) {
+            throw new IOException("ffmpeg not found — is it installed? " + e.getMessage(), e);
+        }
+
+        Thread reader = new Thread(
+            new RawFrameReaderTask(process.getInputStream(), latestFrame, status, frameCount),
+            "tambocam-reader");
+        reader.setDaemon(true);
+        reader.start();
+
+        Thread stderrReader = new Thread(
+            new StderrReaderTask(process.getErrorStream(), status),
+            "tambocam-stderr");
+        stderrReader.setDaemon(true);
+        stderrReader.start();
+
+        return new FfmpegCameraFrames(latestFrame, status, frameCount, commandLineStr, process, reader);
+    }
+
+    // ── Camera mode probing ─────────────────────────────────────────────
+
+    /**
+     * A supported camera capture mode.
+     */
+    private static final class CameraMode {
+        final int width;
+        final int height;
+        final int fps;
+
+        CameraMode(int width, int height, int fps) {
+            this.width = width;
+            this.height = height;
+            this.fps = fps;
+        }
+
+        /** Total pixels — used to pick the smallest resolution. */
+        int pixels() {
+            return width * height;
+        }
+
+        @Override
+        public String toString() {
+            return width + "x" + height + "@" + fps;
+        }
+    }
+
+    /**
+     * Probes a camera device by running ffmpeg with an intentionally unsupported
+     * setting. ffmpeg prints "Supported modes:" to stderr, which we parse.
+     */
+    private static List<CameraMode> probeCamera(int deviceIndex, String os) {
+        List<CameraMode> modes = new ArrayList<CameraMode>();
+        try {
+            List<String> cmd = new ArrayList<String>();
+            cmd.add("ffmpeg");
+            cmd.add("-hide_banner");
+            cmd.add("-loglevel");
+            cmd.add("error");
+
+            if (os.contains("mac")) {
+                cmd.add("-f");
+                cmd.add("avfoundation");
+                // Use an intentionally unsupported framerate to trigger mode listing
+                cmd.add("-framerate");
+                cmd.add("1");
+                cmd.add("-video_size");
+                cmd.add("1x1");
+                cmd.add("-i");
+                cmd.add(deviceIndex + ":none");
+            } else if (os.contains("win")) {
+                cmd.add("-f");
+                cmd.add("dshow");
+                cmd.add("-list_options");
+                cmd.add("true");
+                cmd.add("-i");
+                cmd.add("video=" + deviceIndex);
+            } else {
+                // Linux v4l2 — try v4l2-ctl first
+                return probeV4l2(deviceIndex);
+            }
+            cmd.add("-t");
+            cmd.add("0");
+            cmd.add("-f");
+            cmd.add("null");
+            cmd.add("-");
+
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.redirectErrorStream(true);
+            Process proc = pb.start();
+            BufferedReader reader = new BufferedReader(
+                new InputStreamReader(proc.getInputStream()));
+
+            String line;
+            while ((line = reader.readLine()) != null) {
+                Matcher m = MODE_PATTERN.matcher(line);
+                if (m.find()) {
+                    int w = Integer.parseInt(m.group(1));
+                    int h = Integer.parseInt(m.group(2));
+                    double fpsVal = Double.parseDouble(m.group(3));
+                    int fps = (int) Math.round(fpsVal);
+                    // Deduplicate: only add if we don't already have this exact mode
+                    boolean duplicate = false;
+                    for (CameraMode existing : modes) {
+                        if (existing.width == w && existing.height == h && existing.fps == fps) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate) {
+                        modes.add(new CameraMode(w, h, fps));
+                    }
+                }
+            }
+            proc.waitFor();
+        } catch (Exception e) {
+            // Probe failed — will fall back to defaults
+        }
+        return modes;
+    }
+
+    /**
+     * Probes Linux v4l2 camera capabilities.
+     */
+    private static List<CameraMode> probeV4l2(int deviceIndex) {
+        List<CameraMode> modes = new ArrayList<CameraMode>();
+        try {
+            ProcessBuilder pb = new ProcessBuilder(
+                "v4l2-ctl", "--device=/dev/video" + deviceIndex, "--list-formats-ext"
+            );
+            pb.redirectErrorStream(true);
+            Process proc = pb.start();
+            BufferedReader reader = new BufferedReader(
+                new InputStreamReader(proc.getInputStream()));
+
+            Pattern sizePattern = Pattern.compile("Size.*?(\\d+)x(\\d+)");
+            Pattern fpsPattern = Pattern.compile("Interval.*?\\((\\d+)\\.\\d+ fps\\)");
+            int lastW = 0, lastH = 0;
+
+            String line;
+            while ((line = reader.readLine()) != null) {
+                Matcher sm = sizePattern.matcher(line);
+                if (sm.find()) {
+                    lastW = Integer.parseInt(sm.group(1));
+                    lastH = Integer.parseInt(sm.group(2));
+                }
+                Matcher fm = fpsPattern.matcher(line);
+                if (fm.find() && lastW > 0) {
+                    int fps = Integer.parseInt(fm.group(1));
+                    modes.add(new CameraMode(lastW, lastH, fps));
+                }
+            }
+            proc.waitFor();
+        } catch (Exception e) {
+            // v4l2-ctl not available
+        }
+        return modes;
+    }
+
+    /**
+     * Picks the best camera mode: smallest resolution ≥ our output size,
+     * preferring higher framerates.
+     */
+    private static CameraMode pickBestMode(List<CameraMode> modes) {
+        if (modes.isEmpty()) {
+            return null;
+        }
+        // Sort by: pixels ascending, then fps descending
+        Collections.sort(modes, new Comparator<CameraMode>() {
+            @Override
+            public int compare(CameraMode a, CameraMode b) {
+                int byPixels = Integer.compare(a.pixels(), b.pixels());
+                if (byPixels != 0) {
+                    return byPixels;
+                }
+                return Integer.compare(b.fps, a.fps); // higher fps first
+            }
+        });
+        // Pick smallest resolution that's at least as big as our output
+        for (CameraMode mode : modes) {
+            if (mode.width >= FRAME_W && mode.height >= FRAME_H) {
+                return mode;
+            }
+        }
+        // All modes are smaller than output (unlikely) — use the largest
+        return modes.get(modes.size() - 1);
+    }
+
+    // ── Command building ────────────────────────────────────────────────
+
+    private static List<String> buildCommand(int deviceIndex, String os, List<CameraMode> modes) {
+        CameraMode best = pickBestMode(modes);
+
+        List<String> cmd = new ArrayList<String>();
         cmd.add("ffmpeg");
         cmd.add("-loglevel");
         cmd.add("error");
 
-        String os = System.getProperty("os.name", "").toLowerCase();
         if (os.contains("mac")) {
-            // macOS: avfoundation
             cmd.add("-f");
             cmd.add("avfoundation");
-            cmd.add("-framerate");
-            cmd.add("30");
-            cmd.add("-video_size");
-            cmd.add("1280x720");
+            if (best != null) {
+                cmd.add("-framerate");
+                cmd.add(String.valueOf(best.fps));
+                cmd.add("-video_size");
+                cmd.add(best.width + "x" + best.height);
+            }
             cmd.add("-pixel_format");
             cmd.add("yuyv422");
             cmd.add("-i");
             cmd.add(deviceIndex + ":none");
         } else if (os.contains("win")) {
-            // Windows: dshow
             cmd.add("-f");
             cmd.add("dshow");
-            cmd.add("-framerate");
-            cmd.add("30");
-            cmd.add("-video_size");
-            cmd.add("640x480");
+            if (best != null) {
+                cmd.add("-framerate");
+                cmd.add(String.valueOf(best.fps));
+                cmd.add("-video_size");
+                cmd.add(best.width + "x" + best.height);
+            }
             cmd.add("-i");
             cmd.add("video=" + deviceIndex);
         } else {
-            // Linux: v4l2
             cmd.add("-f");
             cmd.add("v4l2");
-            cmd.add("-framerate");
-            cmd.add("30");
-            cmd.add("-video_size");
-            cmd.add("640x480");
+            if (best != null) {
+                cmd.add("-framerate");
+                cmd.add(String.valueOf(best.fps));
+                cmd.add("-video_size");
+                cmd.add(best.width + "x" + best.height);
+            }
             cmd.add("-i");
             cmd.add("/dev/video" + deviceIndex);
         }
@@ -111,41 +329,25 @@ final class FfmpegCameraFrames implements AutoCloseable {
         cmd.add("rgb24");
         cmd.add("pipe:1");
 
-        ProcessBuilder builder = new ProcessBuilder(cmd);
-        StringBuilder cmdLine = new StringBuilder();
+        return cmd;
+    }
+
+    private static String formatCommand(List<String> cmd) {
+        StringBuilder sb = new StringBuilder();
         for (String arg : cmd) {
-            if (cmdLine.length() > 0) {
-                cmdLine.append(' ');
+            if (sb.length() > 0) {
+                sb.append(' ');
             }
             if (arg.contains(" ") || arg.contains("(") || arg.contains(")")) {
-                cmdLine.append('"').append(arg).append('"');
+                sb.append('"').append(arg).append('"');
             } else {
-                cmdLine.append(arg);
+                sb.append(arg);
             }
         }
-        String commandLineStr = cmdLine.toString();
-
-        Process process;
-        try {
-            process = builder.start();
-        } catch (IOException e) {
-            throw new IOException("ffmpeg not found — is it installed? " + e.getMessage(), e);
-        }
-
-        Thread reader = new Thread(
-            new RawFrameReaderTask(process.getInputStream(), latestFrame, status, frameCount),
-            "terminalcam-reader");
-        reader.setDaemon(true);
-        reader.start();
-
-        Thread stderrReader = new Thread(
-            new StderrReaderTask(process.getErrorStream(), status),
-            "terminalcam-stderr");
-        stderrReader.setDaemon(true);
-        stderrReader.start();
-
-        return new FfmpegCameraFrames(latestFrame, status, frameCount, commandLineStr, process, reader);
+        return sb.toString();
     }
+
+    // ── Accessors ───────────────────────────────────────────────────────
 
     ImageData latestFrame() {
         return latestFrame.get();
@@ -155,20 +357,10 @@ final class FfmpegCameraFrames implements AutoCloseable {
         return status.get();
     }
 
-    /**
-     * Returns the number of real frames received from ffmpeg so far.
-     *
-     * @return frame count, 0 means no real frames yet
-     */
     int receivedFrames() {
         return frameCount.get();
     }
 
-    /**
-     * Returns the ffmpeg command line that was launched.
-     *
-     * @return the command string
-     */
     String commandLine() {
         return commandLine;
     }
@@ -185,10 +377,6 @@ final class FfmpegCameraFrames implements AutoCloseable {
 
     // ── Raw RGB24 → ImageData conversion ────────────────────────────────
 
-    /**
-     * Converts raw RGB24 bytes into an ImageData.
-     * Each pixel is 3 bytes: R, G, B. No PNG overhead.
-     */
     private static ImageData rgb24ToImageData(byte[] rgb, int w, int h) {
         BufferedImage image = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
         int offset = 0;
@@ -225,7 +413,6 @@ final class FfmpegCameraFrames implements AutoCloseable {
             byte[] buf = new byte[FRAME_BYTES];
             try {
                 while (!Thread.currentThread().isInterrupted()) {
-                    // Read exactly one complete frame (like terminalcam)
                     int offset = 0;
                     while (offset < FRAME_BYTES) {
                         int n = input.read(buf, offset, FRAME_BYTES - offset);

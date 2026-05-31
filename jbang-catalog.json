@@ -1,7 +1,7 @@
 {
   "aliases": {
-    "terminalcam": {
-      "script-ref": "src/TerminalCamDemo.java",
+    "tambocam": {
+      "script-ref": "src/TamboCamDemo.java",
       "description": "Terminal camera monitor — live camera, ASCII art, image viewer"
     }
   }

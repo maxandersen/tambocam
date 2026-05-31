@@ -25,7 +25,7 @@ final class FrameSources {
 
     static FrameSource load(String[] args) throws IOException {
         if (args.length == 0) {
-            return synthetic();
+            return autoDetectCamera();
         }
         if ("--camera".equals(args[0]) || args[0].startsWith("--camera=")) {
             int device = 0;
@@ -49,6 +49,19 @@ final class FrameSources {
             return still(path);
         }
         return syntheticWithStatus("Unsupported source, using synthetic feed: " + path.getFileName());
+    }
+
+    static FrameSource autoDetectCamera() {
+        try {
+            List<CameraDevice> devices = CameraDevice.discover();
+            if (!devices.isEmpty()) {
+                CameraDevice first = devices.get(0);
+                return camera(first.index(), first.name());
+            }
+        } catch (Exception e) {
+            // camera failed — fall through to synthetic
+        }
+        return synthetic();
     }
 
     static FrameSource synthetic() {
