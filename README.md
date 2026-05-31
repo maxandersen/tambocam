@@ -4,11 +4,7 @@
 
 Live camera feed rendered directly in your terminal — ASCII art, half-block pixels, or braille dots. Compact camera-monitor HUD with interactive controls for brightness, contrast, color tints, and render modes.
 
-<p align="center">
-  <video src="https://github.com/maxandersen/tambocam/raw/main/demo.mp4" width="100%" autoplay loop muted>
-    Your browser does not support the video tag. <a href="demo.mp4">Watch the demo</a>.
-  </video>
-</p>
+https://github.com/maxandersen/tambocam/raw/main/demo.mp4
 
 > [!NOTE]
 > **This project is inspired by and pays tribute to [terminalcam](https://gitlab.com/here_forawhile/terminalcam) by [here_forawhile](https://gitlab.com/here_forawhile).** The original terminalcam is a brilliant single-file Python tool that renders live ASCII art from your webcam. We loved the idea and wanted to explore what it would look like built on a Java TUI framework. This is a recreation, not a fork — all code is original, but the concept, UX direction, and "terminal as camera monitor" philosophy come directly from the original. Go check it out and give it a star.
